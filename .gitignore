@@ -6,4 +6,5 @@
 .DS_STORE
 
 # Config
-config
+config/database
+config/imgs
