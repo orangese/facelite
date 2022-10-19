@@ -1,71 +1,46 @@
-"""Facial recognition with FaceNet in Keras, TensorFlow, or TensorRT.
+"""
+Facial recognition with FaceNet in Keras, TensorFlow, or TensorRT.
 """
 
-from copy import copy
-import json
+from __future__ import annotations
+
+import ntpath
 import os
-from timeit import default_timer as timer
 import threading
-import random
+from timeit import default_timer as timer
 
 import cv2
 import numpy as np
-from sklearn import neighbors, svm
 from termcolor import colored
+from loguru import logger
+from tqdm import tqdm
+
+import util
 
 try:
     import pycuda.autoinit  # noqa
     import pycuda.driver as cuda  # noqa
 except (ModuleNotFoundError, ImportError) as e:
-    print(f"[DEBUG] '{e}'. Ignore if GPU is not set up")
+    logger.debug("[GPU] pycuda autoinit failed")
 
 try:
     import tensorrt as trt  # noqa
 except (ModuleNotFoundError, ImportError) as e:
-    print(f"[DEBUG] '{e}'. Ignore if GPU is not set up")
-
-from util.common import DB_LOB, DEFAULT_MODEL, name_cleanup
-from util.detection import FaceDetector, is_looking
-from util.distance import DistMetric
-from util.pbar import ProgressBar
-from util.visuals import Camera, GraphicsRenderer
-from util.log import Logger
-from util.loader import (
-    print_time,
-    screen_data,
-    strip_id,
-    retrieve_embeds,
-    get_frozen_graph,
-)
+    logger.debug("[GPU] tensorrt import failed")
 
 
 class FaceNet:
-    """Class implementation of FaceNet"""
 
-    @print_time("model load time")
+    @util.data.print_time("Model load time")
     def __init__(
         self,
-        model_path=DEFAULT_MODEL,
-        data_path=DB_LOB,
-        input_name="input",
-        output_name="embeddings",
-        input_shape=(160, 160),
-        classifier="svm",
-        gpu_alloc=False,
+        model_path: str,
+        data: util.data.Database,
+        input_name: str = None,
+        output_name: str = None,
+        input_shape: tuple = None,
+        gpu_alloc: bool = False,
     ):
-        """Initializes FaceNet object
-        :param model_path: path to model (default: utils.paths.DEFAULT_MODEL)
-        :param data_path: path to data (default: utils.paths.DB_LOB)
-        :param input_name: input - TF mode only (default: "input:0")
-        :param output_name: output - TF mode only (default: "embeddings:0")
-        :param input_shape: input shape in HW (default: (160, 160))
-        :param classifier: classifier type (default: 'svm')
-        :param gpu_alloc: allow GPU growth (default: False)
-        """
-
-        assert os.path.exists(model_path), f"{model_path} not found"
-        assert not data_path or os.path.exists(data_path), f"{data_path} not found"
-
         if gpu_alloc:
             import tensorflow as tf  # noqa
 
@@ -81,66 +56,28 @@ class FaceNet:
         elif ".tflite" in model_path:
             self._tflite_init(model_path)
         elif ".pb" in model_path:
-            self._tf_init(
-                model_path, input_name + ":0", output_name + ":0", input_shape
-            )
+            self._tf_init(model_path, input_name, output_name, input_shape)
         elif ".engine" in model_path:
             self._trt_init(model_path, input_shape)
         else:
             raise TypeError("model must be an .h5, .pb, or .engine file")
-        print(f"[DEBUG] inference backend is {self.mode}")
 
-        self._db = {}
-        self._db_threshold = {}
-        self._db_threshold_stripped = {}
-        self.classifier = None
-        self.classifier_type = classifier
+        logger.debug(f"Inference backend is {self.mode}")
 
-        if data_path:
-            self.set_data(*retrieve_embeds(data_path))
-        else:
-            print("[DEBUG] data not set. Set it manually with set_data")
+        self.db = data
 
     @property
-    def data(self):
-        """Property for static database of embeddings
-        :returns: self._db
-        """
+    def data(self) -> dict:
+        return self.db.data
 
-        return self._db
-
-    @property
-    def metadata(self):
-        return {
-            "metric": self.dist_metric.metric,
-            "normalize": self.dist_metric.normalize,
-            "alpha": self.alpha,
-            "img_norm": self.img_norm,
-        }
-
-    @property
-    def data_threshold(self):
-        """Property for static database of thresholds
-        :returns: self._db_threshold
-        """
-        return self._db_threshold
-
-    def _keras_init(self, filepath):
-        """Initializes a Keras model
-        :param filepath: path to model (.h5)
-        """
-
+    def _keras_init(self, filepath: str):
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "keras"
         self.facenet = tf.keras.models.load_model(filepath)
         self.img_shape = self.facenet.input_shape[1:3]
 
-    def _tflite_init(self, filepath):
-        """Initializes a tflite model interpreter
-        :param filepath: path to model (.tflite)
-        """
-
+    def _tflite_init(self, filepath: str):
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "tflite"
@@ -151,14 +88,11 @@ class FaceNet:
         self.output_details = self.facenet.get_output_details()
         self.img_shape = self.input_details[0]["shape"].tolist()[1:-1]
 
-    def _tf_init(self, filepath, input_name, output_name, input_shape):
-        """Initializes a TensorFlow model
-        :param filepath: path to model (.pb)
-        :param input_name: name of input tensor
-        :param output_name: name of output tensor
-        :param input_shape: input shape for facenet
-        """
-
+    def _tf_init(self,
+                 filepath: str,
+                 input_name: str = "input",
+                 output_name: str = "embeddings",
+                 input_shape: tuple = (160, 160)):
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "tf"
@@ -167,18 +101,16 @@ class FaceNet:
         self.output_name = output_name
         self.img_shape = input_shape
 
-        graph_def = get_frozen_graph(filepath)
+        with tf.gfile.FastGFile(filepath, "rb") as graph_file:
+            graph_def = tf.GraphDef()
+            graph_def.ParseFromString(graph_file.read())
+
         self.sess = tf.keras.backend.get_session()
 
         tf.import_graph_def(graph_def, name="")
         self.facenet = self.sess.graph
 
     def _trt_init(self, filepath, input_shape):
-        """TensorRT initialization
-        :param filepath: path to serialized engine
-        :param input_shape: input shape
-        """
-
         self.mode = "trt"
         try:
             self.dev_ctx = cuda.Device(0).make_context()
@@ -207,120 +139,26 @@ class FaceNet:
 
         self.img_shape = input_shape
 
-    def add_entry(self, person, embeddings, train_classifier=True):
-        """Adds entry (person, embeddings) to database
-        :param person: new entry
-        :param embeddings: new entry's list of embeddings
-        :param train_classifier: train classifier (default: True)
+    def embed(self, imgs: np.ndarray) -> np.ndarray:
         """
-        screen_data(person, embeddings)
-
-        embeds = np.array(embeddings).reshape(len(embeddings), -1)
-        self._db[person] = embeds
-        self._db_threshold[person] = 0
-
-        stripped = strip_id(person)
-        self._stripped_names.append(stripped)
-
-        try:
-            embeds = np.concatenate([self._stripped_db[stripped], embeds])
-        except KeyError:
-            pass
-        self._stripped_db[stripped] = embeds
-
-        if train_classifier:
-            self._train_classifier()
-
-    def remove_entry(self, person, train_classifier=True):
-        """Removes all embeds of person from database.
-        :param person: entry to remove
-        :param train_classifier: train classifier (default: True)
-        """
-        keys = list(self.data.keys())
-        stripped = strip_id(person)
-
-        for name in keys:
-            if strip_id(name) == stripped:
-                del self._db[name]
-                del self._stripped_names[keys.index(name)]
-
-                try:
-                    del self._stripped_db[stripped]
-                except KeyError:
-                    pass
-
-        if train_classifier:
-            self._train_classifier()
-
-    def set_data(self, data, metadata):
-        """Sets data property
-        :param data: new data in form {name: embedding vector, ...}
-        :param metadata: data metadata
-        """
-        assert metadata, "metadata must be provided"
-
-        self._db = {}
-        self._stripped_db = {}
-        self._stripped_names = []
-        self.data_cfg = metadata
-
-        self.dist_metric = DistMetric(
-            self.data_cfg["metric"],
-            self.data_cfg["normalize"],
-            self.data_cfg.get("mean"),
-        )
-        self.alpha = self.data_cfg["alpha"]
-        self.img_norm = self.data_cfg["img_norm"]
-
-        if data:
-            for person, embed in data.items():
-                self.add_entry(person, embed, train_classifier=False)
-            self.apply_thresholds()
-            self._train_classifier()
-
-    def _train_classifier(self):
-        """Trains person classifier"""
-        try:
-            if self.classifier_type == "svm":
-                self.classifier = svm.SVC(kernel="linear")
-            elif self.classifier_type == "knn":
-                self.classifier = neighbors.KNeighborsClassifier()
-
-            embeds = np.squeeze(list(self.data.values()), axis=1)
-            self.classifier.fit(embeds, self._stripped_names)
-
-        except (AttributeError, ValueError):
-            raise ValueError("Current model incompatible with database")
-
-    def normalize(self, imgs):
-        if self.img_norm == "per_image":
-            # linearly scales x to have mean of 0, variance of 1
-            std_adj = np.std(imgs, axis=(1, 2, 3), keepdims=True)
-            std_adj = np.maximum(std_adj, 1.0 / np.sqrt(imgs.size / len(imgs)))
-            mean = np.mean(imgs, axis=(1, 2, 3), keepdims=True)
-            return (imgs - mean) / std_adj
-        elif self.img_norm == "fixed":
-            # scales x to [-1, 1]
-            return (imgs - 127.5) / 128.0
-        else:
-            return imgs
-
-    def embed(self, imgs):
-        """Embeds cropped face
+        Embeds cropped face.
         :param imgs: list of cropped faces with shape (b, h, w, 3)
         :returns: embedding as array with shape (1, -1)
         """
 
         if self.mode == "keras":
             embeds = self.facenet.predict(imgs, batch_size=len(imgs))
+
         elif self.mode == "tf":
             out = self.facenet.get_tensor_by_name(self.output_name)
             embeds = self.sess.run(out, feed_dict={self.input_name: imgs})
+
         elif self.mode == "tflite":
             imgs = imgs.astype(np.float32)
             self.facenet.set_tensor(self.input_details[0]["index"], imgs)
             self.facenet.invoke()
             embeds = self.facenet.get_tensor(self.output_details[0]["index"])
+
         else:
             if len(imgs) != 1:
                 raise NotImplementedError("trt batch not yet supported")
@@ -342,8 +180,14 @@ class FaceNet:
 
         return embeds.reshape(len(imgs), -1)
 
-    def predict(self, img, detector, margin=10, flip=False, verbose=True):
-        """Embeds and normalizes an image from path or array
+    def predict(self,
+                img: np.ndarray,
+                detector: util.detection.FaceDetector,
+                margin: int = 10,
+                flip: bool = False,
+                verbose: bool = True) -> tuple[np.ndarray | None, dict | None]:
+        """
+        Embeds and normalizes an image from path or array.
         :param img: image to be predicted on (BGR image)
         :param detector: FaceDetector object
         :param margin: margin for MTCNN face cropping (default: 10)
@@ -358,9 +202,9 @@ class FaceNet:
 
         start = timer()
 
-        normalized = self.normalize(np.array(cropped_faces))
+        normalized = self.db.normalize(np.array(cropped_faces))
         embeds = self.embed(normalized)
-        embeds = self.dist_metric.apply_norms(embeds, batch=True)
+        embeds = self.db.dist_metric.apply_norms(embeds, batch=True)
 
         if verbose:
             elapsed = round(1000.0 * (timer() - start), 2)
@@ -370,13 +214,13 @@ class FaceNet:
 
         return embeds, face_coords
 
-    def recognize(self, img, *args, verbose=True, mode="cosine", **kwargs):
-        """Facial recognition
+    def recognize(self,
+                  img: np.ndarray,
+                  **kwargs) -> tuple:
+        """
+        Facial recognition on input image
         :param img: image array in BGR mode
-        :param args: will be passed to self.predict
-        :param verbose: verbose or not (default: True)
         :param kwargs: will be passed to self.predict
-        :param mode: ["cosine", "adaptive_threshold"]
         :returns: face, is recognized, best match, time elapsed
         """
         start = timer()
@@ -386,40 +230,20 @@ class FaceNet:
         face = None
 
         try:
-            embeds, face = self.predict(img, *args, **kwargs, verbose=verbose)
+            embeds, face = self.predict(img, **kwargs)
             if embeds is not None:
-                intruder = self.is_intruder(embeds)
-                if not intruder:
-                    if mode == "adaptive":
-                        best_match = self.classifier.predict(embeds)[0]
+                nearest, best_match = self.db.nearest_embed(embeds)
+                dists = self.db.dist_metric.distance(embeds, nearest, batch=True)
+                dist = np.average(dists)
+                is_recognized = dist <= self.db.metadata["alpha"]
 
-                        other = np.average(self._stripped_db[best_match], axis=0)
-                        simliarity_score = self.compute_similarity(embeds, other)
-                        threshold = np.average(self._db_threshold_stripped[best_match])
-                        is_recognized = simliarity_score >= threshold
-
-                        if verbose and simliarity_score:
-                            info = colored(
-                                f"{round(simliarity_score, 4)} > {round(threshold, 4)} ({best_match})",
-                                color="green" if is_recognized else "red",
-                            )
-                            print(f"adaptive thresholding: {info}")
-                    elif mode == "cosine":
-                        best_match = self.classifier.predict(embeds)[0]
-
-                        nearest = self._stripped_db[best_match]
-                        dists = self.dist_metric.distance(embeds, nearest, True)
-                        dist = np.average(dists)
-                        is_recognized = dist <= self.alpha
-
-                        if verbose and dist:
-                            info = colored(
-                                f"{round(dist, 4)} ({best_match})",
-                                color="green" if is_recognized else "red",
-                            )
-                            print(f"{self.dist_metric}: {info}")
-                    else:
-                        raise Exception("Invalid face recognition mode")
+                if kwargs.get("verbose", True) and dist:
+                    info = colored(
+                        f"{round(dist, 4)} ({best_match}), "
+                        f"α={self.db.metadata['alpha']}",
+                        color="green" if is_recognized else "red",
+                    )
+                    print(f"{self.db.dist_metric}: {info}")
 
         except (ValueError, cv2.error) as error:
             incompatible = "query data dimension"
@@ -433,40 +257,22 @@ class FaceNet:
         elapsed = round(1000.0 * (timer() - start), 4)
         return face, is_recognized, best_match, elapsed
 
-    def real_time_recognize(
-        self,
-        width=640,
-        height=360,
-        resize=1.0,
-        detector="mtcnn",
-        flip=False,
-        graphics=True,
-        socket=None,
-        mtcnn_stride=1,
-        mode="cosine",
-    ):
-        """Real-time facial recognition
-        :param width: width of frame (default: 640)
-        :param height: height of frame (default: 360)
-        :param resize: resize scale (default: 1. = no resize)
-        :param detector: face detector type (default: "mtcnn")
-        :param flip: whether to flip horizontally or not (default: False)
-        :param graphics: whether or not to use graphics (default: True)
-        :param socket: socket (dev) (default: None)
-        :param mtcnn_stride: stride frame stride (default: 1)
-        :param mode: ["default", "adaptive_threshold"] (default: "default)
-        """
-
-        assert self._db, "data must be provided"
+    def run_on_stream(self,
+                      cap: object,
+                      resize: float = 1.0,
+                      flip: bool = False,
+                      detector: util.detection.FaceDetector = None,
+                      drawer: util.visuals.GraphicsRenderer = None,
+                      logger: util.log.Logger = None) -> util.log.Logger:
+        assert self.db.data, "data must be provided"
         assert 0.0 <= resize <= 1.0, "resize must be in [0., 1.]"
 
-        graphics_controller = GraphicsRenderer(width, height, resize)
-        logger = Logger(frame_limit=10, frame_threshold=5)
-        pbar = ProgressBar(logger, ws=socket)
-        cap = Camera()
-        detector = FaceDetector(
-            detector, self.img_shape, min_face_size=240, stride=mtcnn_stride
-        )
+        if detector is None:
+            detector = util.detection.FaceDetector(img_shape=self.img_shape)
+        if drawer is None:
+            drawer = util.visuals.GraphicsRenderer(resize=resize)
+        if logger is None:
+            logger = util.log.Logger()
 
         while True:
             _, frame = cap.read()
@@ -477,146 +283,62 @@ class FaceNet:
                 frame = cv2.resize(frame, (0, 0), fx=resize, fy=resize)
 
             # facial detection and recognition
-            info = self.recognize(frame, detector, flip=flip, mode=mode)
+            info = self.recognize(frame, detector=detector, flip=flip)
             face, is_recognized, best_match, elapsed = info
 
-            # logging and socket
-            if is_recognized and is_looking(face):
-                log_result = logger.log(best_match)
-                pbar.update(end=log_result is not None)
-                if log_result and socket:
-                    socket.send(json.dumps({"best_match": best_match}))
+            # logging and pbar
+            if is_recognized and util.detection.is_looking(face):
+                logger.log(best_match)
 
             # graphics
-            if graphics:
-                graphics_controller.add_graphics(cframe, *info)
-                cv2.imshow("AI Security v2021.0.1", cframe)
+            if drawer:
+                drawer.add_graphics(cframe, *info)
+                cv2.imshow("FaceNet", cframe)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
         cap.release()
         cv2.destroyAllWindows()
 
-    def compute_similarity(self, embedding1, embedding2) -> float:
-        """Calculates the similarity score.
+        return logger
 
-        Parameters:
-            embedding1 (embedding): The first embedding.
-            embedding2 (embedding): The second embedding to be compared with.
+    def embed_dir(self,
+                  img_dir: str,
+                  people: list[str] = None,
+                  return_fails: bool = False,
+                  **kwargs) -> tuple[dict, list] | dict:
+        if people is None:
+            people = [
+                os.path.join(img_dir, f)
+                for f in os.listdir(img_dir)
+                if f.endswith("jpg") or f.endswith("png")
+            ]
+        if "detector" not in kwargs:
+            detector = util.detection.FaceDetector(img_shape=self.img_shape)
+            kwargs["detector"] = detector
+        if "verbose" not in kwargs:
+            kwargs["verbose"] = False
 
-        Returns (float):
-            Similarity score.
+        data = {}
+        no_faces = []
 
-        """
-        return 1 - self.dist_metric.distance(embedding1, embedding2, True)[0]
-
-    def find_threshold(self, person) -> float:
-        """Calculates the adaptive threshold for each person.
-
-        Parameters:
-            person (str): Person's name.
-
-        Returns (float):
-            The threshold value.
-
-        """
-        embedding = self.data[person]
-        compares = []
-        people = copy(self.data)
-        del people[person]
-        people_thresholds = people.values()
-        for x in people_thresholds:
-            s = self.compute_similarity(embedding, x)
-            compares.append(s)
-
-        return np.max(np.std(compares))
-
-    def apply_thresholds(self) -> None:
-        """Applys the threshold values to every person in the database."""
-        people = list(self.data.keys())
-        i = 0
-        for person in people:
-            thresholds = [0]
-            if i != 0:
-                thresholds = [0, self.find_threshold(people[i - 1])]
-
-            for j in range(len(people)):
-                person_name1 = name_cleanup(people[j])
-                person_name2 = name_cleanup(person)
-                if person_name1 != person_name2:
-                    thresholds.append(
-                        self.compute_similarity(self.data[people[j]], self.data[person])
-                    )
-
-            self._db_threshold[person] = np.max(thresholds)
-            if name_cleanup(person) in list(self._db_threshold_stripped.keys()):
-                self._db_threshold_stripped[name_cleanup(person)].append(
-                    self._db_threshold[person]
-                )
+        for person in tqdm(people):
+            if not person.endswith("jpg") and not person.endswith("png"):
+                logger.error(f"'{person}' not a jpg or png image")
+                no_faces.append(person)
+            elif os.path.getsize(person) > 1e8:
+                logger.error(f"'{person}' too large (> 100M bytes)")
+                no_faces.append(person)
             else:
-                self._db_threshold_stripped[name_cleanup(person)] = []
-            i += 1
+                embeds, _ = self.predict(cv2.imread(person), **kwargs)
+                if embeds is not None:
+                    person = ntpath.basename(person)
+                    person = person.replace(".jpg", "").replace(".png", "")
+                    data[person] = embeds.reshape(len(embeds), -1)
+                else:
+                    no_faces.append(person)
+                    logger.error(f"no face detected for '{person}'")
 
-    def find_similar_embedding(self, embedding) -> int:
-        """Returns index of similar embedding from self.data.
-
-        Parameters:
-            embedding (embedding): Embedding to be compared with.
-
-        """
-        compares = []
-        for x in self.data.values():
-            s = self.compute_similarity(embedding, x)
-            compares.append(s)
-        return np.argmax(compares)
-
-    def is_intruder(self, embedding) -> bool:
-        """Returns a boolean if the person's embedding is registered
-        in the database or not.
-
-        Parameters:
-            embedding (embedding): Embedding to be compared with.
-
-        Returns (bool):
-            Is intruder or not.
-
-        """
-        simliar_index = self.find_similar_embedding(embedding)
-        other = list(self.data.values())[simliar_index]
-        simliarity_score = self.compute_similarity(embedding, other)
-        threshold = self.data_threshold[list(self.data.keys())[simliar_index]]
-
-        return simliarity_score < threshold
-
-    def adapt_evaluation(self, embedding, detected_person) -> bool:
-        """This was in the article about adaptive thresholding.
-        https://arxiv.org/pdf/1810.11160.pdf
-
-        Parameters:
-            embedding (embedding): Embedding that is inputted into the recognition program
-            detected_person (str): The detected person's key in the database
-
-        Return (str):
-            Case type.
-
-        """
-        simliar_index = self.find_similar_embedding(embedding)
-        other_key = list(self.data.keys())[simliar_index]
-        other_val = list(self.data.values())[simliar_index]
-        simliarity_score = self.compute_similarity(embedding, other_val)
-        threshold = self.data_threshold[list(self.data.keys())[simliar_index]]
-
-        case_type = None
-        if simliarity_score >= threshold and name_cleanup(other_key) == detected_person:
-            case_type = "true accept"
-
-        if simliarity_score < threshold and other_key in list(self.data.keys()):
-            case_type = "false reject"
-
-        if simliarity_score >= threshold and other_key not in list(self.data.keys()):
-            case_type = "false accept"
-
-        if simliarity_score < threshold and other_key not in list(self.data.keys()):
-            case_type = "true reject"
-
-        return case_type, simliarity_score
+        if return_fails:
+            return data, no_faces
+        return data

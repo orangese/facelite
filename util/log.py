@@ -1,16 +1,17 @@
+import datetime
+
+
 class Logger:
-    def __init__(self, frame_limit: int, frame_threshold) -> None:
+
+    def __init__(self, frame_limit: int = 10, frame_threshold: int = 5):
         # NOTE: Array for matches, sorted chronologically.
         # if len > frame_limit, remove index 0
-        self.matches = []
-        for i in range(frame_limit):
-            self.matches.append("")
-
+        self.matches = ["" * frame_limit]
         self.frame_limit = frame_limit
         self.frame_threshold = frame_threshold
+        self.log = {}
 
-    def log(self, best_match) -> str:
-        best_match = str(best_match)
+    def log(self, best_match: str):
         self.matches.append(best_match)
 
         # NOTE: Remove index 0 which is chronologically last frame
@@ -34,6 +35,4 @@ class Logger:
                 )
                 # NOTE: if frequency == threshold, detect
                 if match_frequencies.get(current_match) >= self.frame_threshold:
-                    return current_match
-
-        return ""
+                    self.log[datetime.datetime.now()] = current_match

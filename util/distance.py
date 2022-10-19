@@ -13,7 +13,7 @@ class DistMetric:
         self.normalize = normalize
         self.mean = mean
 
-    def apply_norms(self, x: float, batch: bool = False) -> float:
+    def apply_norms(self, x: np.ndarray, batch: bool = False) -> np.ndarray:
         if self.mean:
             x -= self.mean
         if self.normalize:

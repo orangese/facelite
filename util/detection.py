@@ -60,17 +60,21 @@ def get_mtcnn(
 class FaceDetector:
     def __init__(
         self,
-        mode,
-        img_shape: Tuple[int, int] = (160, 160),
+        mode: str = "mtcnn",
+        img_shape: Tuple[int, int] = None,
         alpha: float = 0.8,
         stride: int = 1,
-        min_face_size: int = 40,
+        min_face_size: int = 240,
     ) -> None:
         assert mode in ("mtcnn", "trt-mtcnn"), f"{mode} not supported"
 
         self.mode = mode
         self.alpha = alpha
-        self.img_shape = tuple(img_shape)
+        if img_shape is not None:
+            self.img_shape = tuple(img_shape)
+        else:
+            self.img_shape = (160, 160)
+
         self.stride = stride
         self.min_face_size = min_face_size
         self.frame_ct = 0

@@ -1,4 +1,5 @@
-"""Graphics util.
+"""
+Graphics util.
 """
 
 from abc import ABC, abstractmethod
@@ -6,13 +7,13 @@ import threading
 
 import cv2
 import numpy as np
-
-from util.common import HAS_RS
+from loguru import logger
 
 try:
     import pyrealsense2 as rs
+    HAS_RS = True
 except (ModuleNotFoundError, ImportError) as e:
-    print(f"[DEBUG] '{e}'. Ignore if Realsense is not set up")
+    logger.debug(f"pyrealsense2 is not set up")
     HAS_RS = False
 
 
