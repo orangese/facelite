@@ -30,6 +30,10 @@ except (ModuleNotFoundError, ImportError) as e:
 
 
 class FaceNet:
+    """
+    Facial recognition. Most work (facial detection, graphics, etc) is handled
+    by `util`. CNN embedding by FaceNet is handled here.
+    """
 
     @util.data.print_time("Model load time")
     def __init__(
@@ -41,6 +45,21 @@ class FaceNet:
         input_shape: tuple = None,
         gpu_alloc: bool = False,
     ):
+        """
+        Initializes FaceNet object.
+
+        :param model_path: path to file (.pb, .h5, .tflite, or .engine)
+        :param data: Database object that contains facial recognition database.
+            Can use empty database but must load data manually
+        :param input_name: name of input tensor, ignore if not using TF mode
+            (default: None)
+        :param output_name: name of output tensor, ignore if not using TF mode
+            (default: None)
+        :param input_shape: shape of input tensor, ignore if not using TF mode
+            (default: None)
+        :param gpu_alloc: if true, allows memory growth on GPU in TF mode
+            (default: False)
+        """
         if gpu_alloc:
             import tensorflow as tf  # noqa
 
@@ -68,9 +87,17 @@ class FaceNet:
 
     @property
     def data(self) -> dict:
+        """
+        Returns database data.
+
+        :return: data in dict format
+        """
         return self.db.data
 
     def _keras_init(self, filepath: str):
+        """
+        Initializes model from keras engine.
+        """
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "keras"
@@ -78,6 +105,9 @@ class FaceNet:
         self.img_shape = self.facenet.input_shape[1:3]
 
     def _tflite_init(self, filepath: str):
+        """
+        Initializes model from tflite engine.
+        """
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "tflite"
@@ -93,6 +123,9 @@ class FaceNet:
                  input_name: str = "input",
                  output_name: str = "embeddings",
                  input_shape: tuple = (160, 160)):
+        """
+        Initializes model from pb graphdef (TF v1).
+        """
         import tensorflow.compat.v1 as tf  # noqa
 
         self.mode = "tf"
@@ -111,6 +144,9 @@ class FaceNet:
         self.facenet = self.sess.graph
 
     def _trt_init(self, filepath, input_shape):
+        """
+        Initializes model from tensorrt engine.
+        """
         self.mode = "trt"
         try:
             self.dev_ctx = cuda.Device(0).make_context()
@@ -132,7 +168,6 @@ class FaceNet:
 
             self.d_input = cuda.mem_alloc(self.h_input.nbytes)
             self.d_output = cuda.mem_alloc(self.h_output.nbytes)
-            print("here")
 
         except NameError:
             raise ValueError("trt mode requested but not available")
@@ -142,6 +177,7 @@ class FaceNet:
     def embed(self, imgs: np.ndarray) -> np.ndarray:
         """
         Embeds cropped face.
+
         :param imgs: list of cropped faces with shape (b, h, w, 3)
         :returns: embedding as array with shape (1, -1)
         """
@@ -188,7 +224,8 @@ class FaceNet:
                 verbose: bool = True) -> tuple[np.ndarray | None, dict | None]:
         """
         Embeds and normalizes an image from path or array.
-        :param img: image to be predicted on (BGR image)
+
+        :param img: image to be predicted on (BGR image without batch dim)
         :param detector: FaceDetector object
         :param margin: margin for MTCNN face cropping (default: 10)
         :param flip: flip and concatenate or not (default: False)
@@ -218,8 +255,9 @@ class FaceNet:
                   img: np.ndarray,
                   **kwargs) -> tuple:
         """
-        Facial recognition on input image
-        :param img: image array in BGR mode
+        Facial recognition on input image.
+
+        :param img: image array in BGR mode (without batch dimension)
         :param kwargs: will be passed to self.predict
         :returns: face, is recognized, best match, time elapsed
         """
@@ -261,9 +299,30 @@ class FaceNet:
                       cap: object,
                       resize: float = 1.0,
                       flip: bool = False,
+                      use_graphics: bool = True,
                       detector: util.detection.FaceDetector = None,
                       drawer: util.visuals.GraphicsRenderer = None,
                       logger: util.log.Logger = None) -> util.log.Logger:
+        """
+        Runs facial recognition on live-streamed data. Spawns output frame
+        video and returns logging history.
+
+        :param cap: cv2.VideoCapture object or util.visual.Camera object, 
+            must support `read` and `release` methods
+        :param resize: resizes window by scale factor, used for faster
+            inference (default: 1.0)
+        :param flip: if True, flips each frame (default: False)
+        :param use_graphics: if True, display output video stream (default: True)
+        :param detector: if specified, uses this FaceDetector object 
+            to detect faces. If None, initializes new FaceDetector with
+            default parameters (default: None).
+        :param drawer: if specified, uses this GraphicsRenderer object 
+            to draw box on output frame. If None, initializes new GraphicsRenderer with
+            default parameters (default: None).
+        :param drawer: if specified, uses this Logger object to record activity. 
+            If None, initializes new Logger with default parameters (default: None).
+        :return: Logger object with detection history
+        """
         assert self.db.data, "data must be provided"
         assert 0.0 <= resize <= 1.0, "resize must be in [0., 1.]"
 
@@ -291,7 +350,7 @@ class FaceNet:
                 logger.log(best_match)
 
             # graphics
-            if drawer:
+            if use_graphics:
                 drawer.add_graphics(cframe, *info)
                 cv2.imshow("FaceNet", cframe)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -307,6 +366,22 @@ class FaceNet:
                   people: list[str] = None,
                   return_fails: bool = False,
                   **kwargs) -> tuple[dict, list] | dict:
+        """
+        Generates facial embedding vectors from directory of images. Faces are 
+        detected by MTCNN and do not need to be pre-cropped.
+
+        :param img_dir: directory of images. In the return dict, each key will
+        correspond to an image file name with the extension removed. All images
+        must be in .png or .jpg format.
+        :param people: list of names to include in the embedding process. Each 
+        entry must exactly match the image filenames. If None, loops over 
+        all images in the directory (default: None).
+        :param return_fails: if True, returns names of files for which detection
+        or recognition failed (default: False).
+        :param kwargs: extra params to `self.predict`
+        :return: dict with keys as filenames (stripped of extensions) mapped to
+        embedding vectors. If `return_fails`, also returns list of failed files.
+        """
         if people is None:
             people = [
                 os.path.join(img_dir, f)
