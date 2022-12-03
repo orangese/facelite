@@ -36,15 +36,13 @@ class FaceNet:
     """
 
     @util.data.print_time("Model load time")
-    def __init__(
-        self,
-        model_path: str,
-        data: util.data.Database,
-        input_name: str = None,
-        output_name: str = None,
-        input_shape: tuple = None,
-        gpu_alloc: bool = False,
-    ):
+    def __init__(self,
+                 model_path: str,
+                 data: util.data.Database,
+                 input_name: str = None,
+                 output_name: str = None,
+                 input_shape: tuple = None,
+                 gpu_alloc: bool = False):
         """
         Initializes FaceNet object.
 
